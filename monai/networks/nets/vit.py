@@ -198,8 +198,7 @@ class ViTDet(nn.Module):
         self.img_size = img_size
 
         self.patch_embed = PatchEmbed(
-            kernel_size=(patch_size, patch_size),
-            stride=(patch_size, patch_size),
+            patch_size=(patch_size, patch_size),
             in_chans=in_chans,
             embed_dim=embed_dim,
             spatial_dims=2,
