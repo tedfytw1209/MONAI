@@ -103,16 +103,15 @@ class OBJDetectInference():
             affine_lps_to_ras=True,
             amp=amp,
         )
-        # !!!need change to test / not inference
-        inference_transforms, post_transforms = generate_detection_inference_transform(
-        "image",
-        "pred_box",
-        "pred_label",
-        "pred_score",
-        class_args.gt_box_mode,
-        intensity_transform,
-        affine_lps_to_ras=True,
-        amp=amp,
+        # !!!change to val transform
+        inference_transforms = generate_detection_val_transform(
+            "image",
+            "box",
+            "label",
+            class_args.gt_box_mode,
+            intensity_transform,
+            affine_lps_to_ras=True,
+            amp=amp,
         )
         # 2. prepare training data
         # create a training data loader
@@ -216,6 +215,11 @@ class OBJDetectInference():
             base_anchor_shapes=self.args.base_anchor_shapes,
         )
 
+        coco_metric = COCOMetric(classes=["nodule"], iou_list=[0.1], max_detection=[100])
+        self.train(anchor_generator=anchor_generator, metric=coco_metric, pre_net=pretrain_network, device=device)
+        self.test(anchor_generator=anchor_generator, metric=coco_metric, device=device)
+
+    def train(self, anchor_generator, metric, device, pre_net=None):
         # 1-2. build network & load pre-train network
         #tmp code
         conv1_t_size = [max(7, 2 * s + 1) for s in self.args.conv1_t_stride]
@@ -292,7 +296,6 @@ class OBJDetectInference():
         # initialize tensorboard writer
         tensorboard_writer = SummaryWriter(self.args.tfevent_path)
         val_interval = self.config_dict.get('val_interval', 5)  # do validation every val_interval epochs
-        coco_metric = COCOMetric(classes=["nodule"], iou_list=[0.1], max_detection=[100])
         best_val_epoch_metric = 0.0
         best_val_epoch = -1  # the epoch that gives best validation metrics
         max_epochs = self.config_dict.get('finetune_epochs', 300)
@@ -411,7 +414,7 @@ class OBJDetectInference():
                 torch.cuda.empty_cache()
                 results_metric = matching_batch(
                     iou_fn=box_utils.box_iou,
-                    iou_thresholds=coco_metric.iou_thresholds,
+                    iou_thresholds=metric.iou_thresholds,
                     pred_boxes=[
                         val_data_i[detector.target_box_key].cpu().detach().numpy() for val_data_i in val_outputs_all
                     ],
@@ -426,7 +429,7 @@ class OBJDetectInference():
                         val_data_i[detector.target_label_key].cpu().detach().numpy() for val_data_i in val_targets_all
                     ],
                 )
-                val_epoch_metric_dict = coco_metric(results_metric)[0]
+                val_epoch_metric_dict = metric(results_metric)[0]
                 print(val_epoch_metric_dict)
 
                 # write to tensorboard event
@@ -452,16 +455,17 @@ class OBJDetectInference():
         print(f"train completed, best_metric: {best_val_epoch_metric:.4f} " f"at epoch: {best_val_epoch}")
         tensorboard_writer.close()
 
-        #4. Test
-
+    #4. Test
+    def test(self, anchor_generator, metric, device,net=None):
         # 2) build test network
-        net = torch.jit.load(self.env_dict["model_path"]).to(device)
-        print(f"Load model from {self.env_dict['model_path']}")
+        if net==None:
+            net = torch.jit.load(self.env_dict["model_path"]).to(device)
+            print(f"Load model from {self.env_dict['model_path']}")
+        else:
+            print(f"Use model from function args")
 
         # 3) build detector
         detector = RetinaNetDetector(network=net, anchor_generator=anchor_generator, debug=False)
-
-        # set inference components
         detector.set_box_selector_parameters(
             score_thresh=self.args.score_thresh,
             topk_candidates_per_level=1000,
@@ -469,7 +473,7 @@ class OBJDetectInference():
             detections_per_img=100,
         )
         detector.set_sliding_window_inferer(
-            roi_size=patch_size,
+            roi_size=self.args.val_patch_size,
             overlap=0.25,
             sw_batch_size=1,
             mode="gaussian",
@@ -478,56 +482,55 @@ class OBJDetectInference():
 
         ###!!! need change to our evaluation metric
         # 4. apply trained model
-        results_dict = {"validation": []}
         detector.eval()
         with torch.no_grad():
             start_time = time.time()
-            for inference_data in self.inference_loader:
-                inference_img_filenames = [
-                    inference_data_i["image_meta_dict"]["filename_or_obj"] for inference_data_i in inference_data
-                ]
-                print(inference_img_filenames)
+            detector.eval()
+            test_outputs_all = []
+            test_targets_all = []
+            for test_data in self.inference_loader:
+                # if all val_data_i["image"] smaller than self.args.val_patch_size, no need to use inferer
+                # otherwise, need inferer to handle large input images.
                 use_inferer = not all(
-                    [inference_data_i["image"][0, ...].numel() < np.prod(patch_size) for inference_data_i in inference_data]
+                    [test_data_i["image"][0, ...].numel() < np.prod(self.args.val_patch_size) for test_data_i in test_data]
                 )
-                inference_inputs = [inference_data_i["image"].to(device) for inference_data_i in inference_data]
+                test_inputs = [test_data_i.pop("image").to(device) for test_data_i in test_data]
 
                 if self.amp:
                     with torch.cuda.amp.autocast():
-                        inference_outputs = detector(inference_inputs, use_inferer=use_inferer)
+                        test_outputs = detector(test_inputs, use_inferer=use_inferer)
                 else:
-                    inference_outputs = detector(inference_inputs, use_inferer=use_inferer)
-                del inference_inputs
+                    test_outputs = detector(test_inputs, use_inferer=use_inferer)
 
-                # update inference_data for post transform
-                for i in range(len(inference_outputs)):
-                    inference_data_i, inference_pred_i = (
-                        inference_data[i],
-                        inference_outputs[i],
-                    )
-                    inference_data_i["pred_box"] = inference_pred_i[detector.target_box_key].to(torch.float32)
-                    inference_data_i["pred_label"] = inference_pred_i[detector.target_label_key]
-                    inference_data_i["pred_score"] = inference_pred_i[detector.pred_score_key].to(torch.float32)
-                    inference_data[i] = self.post_transforms(inference_data_i)
+                # save outputs for evaluation
+                test_outputs_all += test_outputs
+                test_targets_all += test_data
 
-                for inference_img_filename, inference_pred_i in zip(inference_img_filenames, inference_data):
-                    result = {
-                        "label": inference_pred_i["pred_label"].cpu().detach().numpy().tolist(),
-                        "box": inference_pred_i["pred_box"].cpu().detach().numpy().tolist(),
-                        "score": inference_pred_i["pred_score"].cpu().detach().numpy().tolist(),
-                    }
-                    result.update({"image": inference_img_filename})
-                    results_dict["validation"].append(result)
-                
-                #compute result
-
-        end_time = time.time()
-        print("Testing time: ", end_time - start_time)
+            # compute metrics
+            del test_inputs
+            torch.cuda.empty_cache()
+            results_metric = matching_batch(
+                iou_fn=box_utils.box_iou,
+                iou_thresholds=metric.iou_thresholds,
+                pred_boxes=[
+                    test_data_i[detector.target_box_key].cpu().detach().numpy() for test_data_i in test_outputs_all
+                ],
+                pred_classes=[
+                    test_data_i[detector.target_label_key].cpu().detach().numpy() for test_data_i in test_outputs_all
+                ],
+                pred_scores=[
+                    test_data_i[detector.pred_score_key].cpu().detach().numpy() for test_data_i in test_outputs_all
+                ],
+                gt_boxes=[test_data_i[detector.target_box_key].cpu().detach().numpy() for test_data_i in test_targets_all],
+                gt_classes=[
+                    test_data_i[detector.target_label_key].cpu().detach().numpy() for test_data_i in test_targets_all
+                ],
+            )
+            test_metric_dict = metric(results_metric)[0]
+            print(test_metric_dict)
+            end_time = time.time()
+            print("Testing time: ", end_time - start_time)
 
         with open(self.args.result_list_file_path, "w") as outfile:
-            json.dump(results_dict, outfile, indent=4)
-
-        
-
-
+            json.dump(test_metric_dict, outfile, indent=4)
 
