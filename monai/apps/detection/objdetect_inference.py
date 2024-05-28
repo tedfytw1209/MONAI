@@ -203,7 +203,6 @@ class OBJDetectInference():
         Returns:
             dict: dictionary with values for evaluation
         """
-        patch_size = self.args.val_patch_size
         #1. build the model
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # 1-1. build anchor generator
