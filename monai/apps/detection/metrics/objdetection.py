@@ -25,7 +25,6 @@ import torch
 from monai.metrics.utils import ignore_background
 from monai.utils import MetricReduction
 
-from .metric import Metric
 import logging as logger
 from collections.abc import Sequence
 from typing import Any
@@ -33,10 +32,25 @@ from typing import Any
 import numpy as np
 
 
-class OBJDetectMetric(Metric):
+class OBJDetectMetric():
 
     def __init__(
         self,
         classes: Sequence[str]
     ):
+        """
+        Class to compute required Obj detection metrics
+        Metrics computed includes, (At what IoU threshold?)
+        -average precision: the area under the PR curve (already in coco.py)
+        -average recall (already in coco.py)
+        -IOU: Intersection / Union of matched points?
+        -mean IOU ?
+
+        Args:
+            classes (Sequence[str]): name of each class (index needs to correspond to predicted class indices!)
+            iou_list (Sequence[float]): specific thresholds where ap is evaluated and saved
+            iou_range (Sequence[float]): (start, stop, step) for mAP iou thresholds
+            max_detection (Sequence[int]): maximum number of detections per image
+            verbose (bool): log time needed for evaluation
+        """
         pass
