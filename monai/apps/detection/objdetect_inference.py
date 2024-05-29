@@ -50,24 +50,38 @@ from monai.transforms import ScaleIntensityRanged
 from monai.utils import set_determinism
 
 class OBJDetectInference():
+    """
+    A inference pipeline for pre-trained model in object detection
+    Take pre-trained model as input, print & write experimental result
 
+    Args:
+        env_dict: envuroment config, include data, model, result path
+        config_dict: training config, include training(finetuning) setting for specific dataset / model / gpu
+        debug_dict: config for debug, only train or only test
+        verbose: bool show details in training or not (for debug),
+    Funcs:
+        compute: run for inference
+        train: training process
+        test: testing process
+    """
     def __init__(
         self,
         env_dict: dict,
         config_dict: dict,
+        debug_dict: dict,
         verbose: bool = False,
     ):
-        set_determinism(seed=0) #reset determinism for const training !!!
         amp = True
         if amp:
-            compute_dtype = torch.float16
+            self.compute_dtype = torch.float16
         else:
-            compute_dtype = torch.float32
-        ''' not need if already set
+            self.compute_dtype = torch.float32
         monai.config.print_config()
-        torch.backends.cudnn.benchmark = True
-        torch.set_num_threads(4)
-        '''
+        if debug_dict.get('set_deter',False):
+            set_determinism(seed=0) #reset determinism for const training !!!
+            torch.backends.cudnn.benchmark = True
+            torch.set_num_threads(4)
+
         class_args = argparse.Namespace()
         for k, v in env_dict.items():
             setattr(class_args, k, v)
@@ -103,7 +117,7 @@ class OBJDetectInference():
             affine_lps_to_ras=True,
             amp=amp,
         )
-        # !!!change to val transform
+        # !!change to val transform
         inference_transforms = generate_detection_val_transform(
             "image",
             "box",
@@ -115,6 +129,7 @@ class OBJDetectInference():
         )
         # 2. prepare training data
         # create a training data loader
+        ### !!! why batch_szie=1?
         train_data = load_decathlon_datalist(
             class_args.data_list_file_path,
             is_segmentation=True,
@@ -175,6 +190,8 @@ class OBJDetectInference():
         self.args = class_args
         self.verbose = verbose
         self.amp = amp
+        self.use_train = debug_dict.get('use_train',True)
+        self.use_test = debug_dict.get('use_test',True)
 
     def __call__(self, *args: Any, **kwargs: Any):
         """
@@ -201,7 +218,7 @@ class OBJDetectInference():
             pre_train_network: model for inference.
 
         Returns:
-            dict: dictionary with values for evaluation
+            dict: dictionary with values for evaluation (include metric in train and test)
         """
         #1. build the model
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -215,10 +232,33 @@ class OBJDetectInference():
         )
 
         coco_metric = COCOMetric(classes=["nodule"], iou_list=[0.1], max_detection=[100])
-        self.train(anchor_generator=anchor_generator, metric=coco_metric, pre_net=pretrain_network, device=device)
-        self.test(anchor_generator=anchor_generator, metric=coco_metric, device=device)
+        train_results, test_results, compute_results = {},{},{}
+        if self.use_train:
+            train_results = self.train(anchor_generator=anchor_generator, metric=coco_metric, pre_net=pretrain_network, device=device)
+        else:
+            print("Debug Mode: skip training process with self.use_train = ",self.use_train)
+        if self.use_test:
+            test_results = self.test(anchor_generator=anchor_generator, metric=coco_metric, device=device)
+        else:
+            print("Debug Mode: skip test process with self.use_test = ",self.use_test)
+        compute_results['infer_train'] = train_results
+        compute_results['infer_test'] = test_results
+        return compute_results
 
     def train(self, anchor_generator, metric, device, pre_net=None):
+        """
+        Training with the `network` pretrained-model (or not).
+        1. First build the model and load pre-trained-model
+        2. Setup finetune setting
+        3. Training (Finetuning)
+        4. Evaluation (Testing)
+        Args:
+            inputs: input of the model inference.
+            pre_train_network: model for inference.
+
+        Returns:
+            dict: dictionary with values for evaluation (include metric in train and test)
+        """
         # 1-2. build network & load pre-train network
         #tmp code
         conv1_t_size = [max(7, 2 * s + 1) for s in self.args.conv1_t_stride]
@@ -249,7 +289,8 @@ class OBJDetectInference():
             )
         )
         #1-3. load pre-train network !!!
-
+        if pre_net!=None:
+            net.load_state_dict(pre_net, strict=False)
 
         # 1-4. build detector
         detector = RetinaNetDetector(network=net, anchor_generator=anchor_generator, debug=self.args.verbose).to(device)
@@ -533,3 +574,66 @@ class OBJDetectInference():
         with open(self.args.result_list_file_path, "w") as outfile:
             json.dump(test_metric_dict, outfile, indent=4)
 
+def load_model(path=None):
+    if path:  # make sure to load pretrained model
+        if '.ckpt' in args.model_path:
+            state = torch.load(args.model_path, map_location='cpu')
+            model = state
+        elif '.pth' in args.model_path:
+            state = torch.load(args.model_path, map_location='cpu')
+            model = state['model']
+    else:
+        model = None
+    return model
+
+if __name__ == "__main__":
+    '''
+    Only for testing all functions in OBJDetectInference.
+    set the part what to test (full obj detect, only train, only test, with pre-trained model).
+    '''
+    #get the config, env, and pre_train network
+    parser = argparse.ArgumentParser(description="PyTorch Object Detection Training")
+    parser.add_argument(
+        "-e",
+        "--environment-file",
+        default="./config/environment.json",
+        help="environment json file that stores environment path",
+    )
+    parser.add_argument(
+        "-c",
+        "--config-file",
+        default="./config/config_train.json",
+        help="config json file that stores hyper-parameters",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        default=False,
+        action="store_true",
+        help="whether to print verbose detail during training, recommand True when you are not sure about hyper-parameters",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default="",
+        help="pre-trained model path for testing",
+    )
+    parser.add_argument( ###!!! not implement now
+        "-t",
+        "--testmode",
+        default="full",
+        help="which part of func need to test, not implement now !!!",
+    )
+    args = parser.parse_args()
+    env_dict = json.load(open(args.environment_file, "r"))
+    config_dict = json.load(open(args.config_file, "r"))
+    pretrained_model = load_model(args.model)
+    test_mode = args.testmode
+    debug_dict = {} #full test
+    if args.testmode=='train': #train func test
+        debug_dict['use_test'] = False
+    elif args.testmode=='test': #test func test
+        debug_dict['use_train'] = False
+    #
+    inferer = OBJDetectInference(env_dict=env_dict, config_dict=config_dict, debug_dict=debug_dict, verbose=args.verbose)
+    inferer.compute(pretrain_network=pretrained_model)
